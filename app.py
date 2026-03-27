@@ -4,6 +4,7 @@ import json
 import tempfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -124,21 +125,66 @@ def build_gap_histogram_df(cleaned_df: pd.DataFrame) -> pd.DataFrame:
     gap_df = gap_df.sort_values("donation_date").reset_index(drop=True)
     gap_df["gap_days"] = gap_df["donation_date"].diff().dt.days
     gap_df = gap_df.dropna(subset=["gap_days"]).copy()
-    gap_df["gap_days"] = gap_df["gap_days"].astype(int)
+    if gap_df.empty:
+        return gap_df
+    gap_df["gap_days"] = gap_df["gap_days"].astype(float)
     return gap_df
+
+
+def make_histogram_series(
+    values: np.ndarray,
+    bins: int = 10,
+    integer_labels: bool = True,
+) -> pd.Series:
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+
+    if values.size == 0:
+        return pd.Series(dtype=int)
+
+    if values.size == 1 or float(values.min()) == float(values.max()):
+        v = values[0]
+        if integer_labels:
+            label = f"[{int(v)}-{int(v)}]"
+        else:
+            label = f"[{v:.2f}-{v:.2f}]"
+        return pd.Series([int(values.size)], index=[label])
+
+    hist, edges = np.histogram(values, bins=bins)
+
+    labels = []
+    for i in range(len(edges) - 1):
+        left = edges[i]
+        right = edges[i + 1]
+
+        if integer_labels:
+            left_label = int(np.floor(left))
+            right_label = int(np.ceil(right))
+            label = f"[{left_label}-{right_label}]"
+        else:
+            label = f"[{left:.2f}-{right:.2f}]"
+
+        labels.append(label)
+
+    return pd.Series(hist, index=labels)
 
 
 def render_result(result: dict, cleaned_df: pd.DataFrame) -> None:
     st.success("Scoring completed.")
 
-    st.subheader("Probability of donation in next 30 days")
+    horizon_days = int(result["horizon_days"])
+    prob_pct = float(result["probability"]) * 100.0
+
+    st.subheader(f"Probability of donation in next {horizon_days} days")
     st.metric(
-        label="Probability of donation in next 30 days",
-        value=f"{result['probability']:.6f}",
+        label=f"Probability of donation in next {horizon_days} days",
+        value=f"{prob_pct:.2f}%",
     )
 
     st.subheader("Input donation history")
-    st.dataframe(cleaned_df, use_container_width=True)
+    display_df = cleaned_df.copy()
+    display_df["donation_date"] = pd.to_datetime(display_df["donation_date"]).dt.strftime("%Y-%m-%d")
+    st.dataframe(display_df, use_container_width=True)
 
     chart_df = cleaned_df.copy()
     chart_df["donation_date"] = pd.to_datetime(chart_df["donation_date"])
@@ -148,15 +194,26 @@ def render_result(result: dict, cleaned_df: pd.DataFrame) -> None:
     st.bar_chart(chart_df)
 
     st.subheader("Donation amount distribution")
-    amount_hist = cleaned_df[["amount"]].copy()
-    st.bar_chart(amount_hist["amount"].value_counts(bins=10).sort_index())
+    amount_hist_series = make_histogram_series(
+        cleaned_df["amount"].to_numpy(),
+        bins=min(10, max(1, len(cleaned_df))),
+        integer_labels=False,
+    )
+    amount_hist_df = amount_hist_series.rename("count").to_frame()
+    st.bar_chart(amount_hist_df)
 
     st.subheader("Donation date gap distribution")
     gap_df = build_gap_histogram_df(cleaned_df)
     if gap_df.empty:
-        st.info("At least two donations are needed to compute date gaps.")
+        st.info("At least two donations are needed to compute donation date gaps.")
     else:
-        st.bar_chart(gap_df["gap_days"].value_counts(bins=10).sort_index())
+        gap_hist_series = make_histogram_series(
+            gap_df["gap_days"].to_numpy(),
+            bins=min(10, max(1, len(gap_df))),
+            integer_labels=True,
+        )
+        gap_hist_df = gap_hist_series.rename("count").to_frame()
+        st.bar_chart(gap_hist_df)
 
 
 def main() -> None:
@@ -196,6 +253,7 @@ def main() -> None:
         st.subheader("Saved model settings")
         st.write(f"Saved horizon_days: `{saved_horizon}`")
         st.write(f"Saved normalize: `{saved_normalize}`")
+
         horizon_days = st.number_input(
             "Horizon days",
             min_value=1,
