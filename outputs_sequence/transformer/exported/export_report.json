@@ -1,0 +1,9 @@
+{
+  "model_dir": "outputs_sequence/transformer",
+  "generated_files": [
+    "outputs_sequence/transformer/exported/transformer_export.onnx",
+    "outputs_sequence/transformer/exported/transformer_export.onnx",
+    "outputs_sequence/transformer/exported/portable_metadata.json"
+  ],
+  "quantization": "none"
+}
