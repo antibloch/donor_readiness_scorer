@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import tempfile
 from pathlib import Path
 
@@ -119,54 +120,129 @@ def build_scoring_xlsx(user_history: pd.DataFrame) -> str:
     return tmp_path
 
 
-def build_gap_histogram_df(cleaned_df: pd.DataFrame) -> pd.DataFrame:
+def build_gap_series(cleaned_df: pd.DataFrame) -> pd.Series:
     gap_df = cleaned_df.copy()
     gap_df["donation_date"] = pd.to_datetime(gap_df["donation_date"])
     gap_df = gap_df.sort_values("donation_date").reset_index(drop=True)
-    gap_df["gap_days"] = gap_df["donation_date"].diff().dt.days
-    gap_df = gap_df.dropna(subset=["gap_days"]).copy()
-    if gap_df.empty:
-        return gap_df
-    gap_df["gap_days"] = gap_df["gap_days"].astype(float)
-    return gap_df
+    gaps = gap_df["donation_date"].diff().dt.days.dropna()
+    return gaps.astype(float)
 
 
-def make_histogram_series(
-    values: np.ndarray,
-    bins: int = 10,
-    integer_labels: bool = True,
-) -> pd.Series:
+def choose_bin_count(n: int, max_bins: int = 12) -> int:
+    if n <= 1:
+        return 1
+    # Sturges-like rule, capped for readability in Streamlit.
+    bins = int(math.ceil(math.log2(n) + 1))
+    return max(1, min(max_bins, bins))
+
+
+def make_adaptive_edges(values: np.ndarray, max_bins: int = 12) -> np.ndarray:
     values = np.asarray(values, dtype=float)
     values = values[~np.isnan(values)]
 
     if values.size == 0:
-        return pd.Series(dtype=int)
+        return np.array([0.0, 1.0], dtype=float)
 
-    if values.size == 1 or float(values.min()) == float(values.max()):
-        v = values[0]
-        if integer_labels:
-            label = f"[{int(v)}-{int(v)}]"
+    vmin = float(np.min(values))
+    vmax = float(np.max(values))
+
+    if math.isclose(vmin, vmax):
+        pad = 0.5 if math.isclose(vmin, 0.0) else max(abs(vmin) * 0.05, 0.5)
+        return np.array([vmin - pad, vmax + pad], dtype=float)
+
+    q1, q3 = np.percentile(values, [25, 75])
+    iqr = float(q3 - q1)
+
+    if iqr > 0:
+        # Freedman–Diaconis rule
+        width = 2.0 * iqr / (values.size ** (1.0 / 3.0))
+        if width > 0:
+            bins = int(math.ceil((vmax - vmin) / width))
         else:
-            label = f"[{v:.2f}-{v:.2f}]"
-        return pd.Series([int(values.size)], index=[label])
+            bins = choose_bin_count(values.size, max_bins=max_bins)
+    else:
+        bins = choose_bin_count(values.size, max_bins=max_bins)
 
-    hist, edges = np.histogram(values, bins=bins)
+    bins = max(1, min(max_bins, bins))
+    edges = np.linspace(vmin, vmax, bins + 1, dtype=float)
 
-    labels = []
+    # Guarantee strictly increasing edges.
+    for i in range(1, len(edges)):
+        if not edges[i] > edges[i - 1]:
+            edges[i] = np.nextafter(edges[i - 1], math.inf)
+
+    return edges
+
+
+def format_bin_value(x: float, integer_like: bool) -> str:
+    if integer_like:
+        return str(int(round(x)))
+    if math.isclose(x, round(x), rel_tol=0.0, abs_tol=1e-9):
+        return str(int(round(x)))
+    if abs(x) >= 100:
+        return f"{x:.1f}"
+    if abs(x) >= 1:
+        return f"{x:.2f}"
+    return f"{x:.3f}"
+
+
+def histogram_from_values(
+    values: np.ndarray,
+    max_bins: int = 12,
+    integer_like: bool = False,
+) -> pd.DataFrame:
+    values = np.asarray(values, dtype=float)
+    values = values[~np.isnan(values)]
+
+    if values.size == 0:
+        return pd.DataFrame(columns=["bin_label", "count"])
+
+    edges = make_adaptive_edges(values, max_bins=max_bins)
+    counts, _ = np.histogram(values, bins=edges)
+
+    labels: list[str] = []
     for i in range(len(edges) - 1):
         left = edges[i]
         right = edges[i + 1]
 
-        if integer_labels:
-            left_label = int(np.floor(left))
-            right_label = int(np.ceil(right))
-            label = f"[{left_label}-{right_label}]"
-        else:
-            label = f"[{left:.2f}-{right:.2f}]"
+        left_str = format_bin_value(left, integer_like=integer_like)
+        right_str = format_bin_value(right, integer_like=integer_like)
 
+        # Use half-open intervals except the last one, which is closed.
+        if i < len(edges) - 2:
+            label = f"[{left_str}, {right_str})"
+        else:
+            label = f"[{left_str}, {right_str}]"
         labels.append(label)
 
-    return pd.Series(hist, index=labels)
+    hist_df = pd.DataFrame(
+        {
+            "bin_label": labels,
+            "count": counts.astype(int),
+            "bin_left": edges[:-1],
+            "bin_right": edges[1:],
+            "bin_order": np.arange(len(labels)),
+        }
+    )
+
+    hist_df = hist_df.sort_values("bin_order").reset_index(drop=True)
+    return hist_df
+
+
+def render_histogram(title: str, values: np.ndarray, integer_like: bool) -> None:
+    st.subheader(title)
+    hist_df = histogram_from_values(
+        values,
+        max_bins=12,
+        integer_like=integer_like,
+    )
+
+    if hist_df.empty:
+        st.info("Not enough data to draw this histogram.")
+        return
+
+    chart_df = hist_df.set_index("bin_label")[["count"]]
+    st.bar_chart(chart_df, use_container_width=True)
 
 
 def render_result(result: dict, cleaned_df: pd.DataFrame) -> None:
@@ -191,29 +267,24 @@ def render_result(result: dict, cleaned_df: pd.DataFrame) -> None:
     chart_df = chart_df.sort_values("donation_date").set_index("donation_date")[["amount"]]
 
     st.subheader("Donation amounts over time")
-    st.bar_chart(chart_df)
+    st.bar_chart(chart_df, use_container_width=True)
 
-    st.subheader("Donation amount distribution")
-    amount_hist_series = make_histogram_series(
-        cleaned_df["amount"].to_numpy(),
-        bins=min(10, max(1, len(cleaned_df))),
-        integer_labels=False,
+    render_histogram(
+        title="Donation amount distribution",
+        values=cleaned_df["amount"].to_numpy(dtype=float),
+        integer_like=False,
     )
-    amount_hist_df = amount_hist_series.rename("count").to_frame()
-    st.bar_chart(amount_hist_df)
 
-    st.subheader("Donation date gap distribution")
-    gap_df = build_gap_histogram_df(cleaned_df)
-    if gap_df.empty:
+    gap_values = build_gap_series(cleaned_df).to_numpy(dtype=float)
+    if gap_values.size == 0:
+        st.subheader("Donation date gap distribution")
         st.info("At least two donations are needed to compute donation date gaps.")
     else:
-        gap_hist_series = make_histogram_series(
-            gap_df["gap_days"].to_numpy(),
-            bins=min(10, max(1, len(gap_df))),
-            integer_labels=True,
+        render_histogram(
+            title="Donation date gap distribution",
+            values=gap_values,
+            integer_like=True,
         )
-        gap_hist_df = gap_hist_series.rename("count").to_frame()
-        st.bar_chart(gap_hist_df)
 
 
 def main() -> None:
