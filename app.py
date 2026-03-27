@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 from pathlib import Path
 
@@ -21,46 +22,49 @@ DEFAULT_EXPORT_SUBDIR = "exported"
 INTERNAL_EMAIL = "demo_user@example.com"
 
 
-def ensure_required_files(
+def load_model_metadata(output_root: str, model_name: str) -> dict:
+    model_dir = Path(output_root) / model_name
+    metadata_path = model_dir / "model_metadata.json"
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"Missing model metadata: {metadata_path}")
+    return json.loads(metadata_path.read_text())
+
+
+def resolve_onnx_path(
     output_root: str,
     model_name: str,
     export_subdir: str,
     exported_model: str | None,
-) -> tuple[bool, list[str], str | None]:
-    errors: list[str] = []
-
+) -> str:
     model_dir = Path(output_root) / model_name
-    metadata_path = model_dir / "model_metadata.json"
     export_dir = model_dir / export_subdir
-
-    if not metadata_path.exists():
-        errors.append(f"Missing model metadata: `{metadata_path}`")
 
     if exported_model:
         onnx_path = Path(exported_model)
         if not onnx_path.exists():
-            errors.append(f"Specified exported model not found: `{onnx_path}`")
-        resolved_model = str(onnx_path)
-    else:
-        if not export_dir.exists():
-            errors.append(f"Missing export directory: `{export_dir}`")
+            raise FileNotFoundError(f"Specified exported model not found: {onnx_path}")
+        return str(onnx_path)
 
-        candidates = [
-            export_dir / "transformer_export_int8.onnx",
-            export_dir / "transformer_export.onnx",
-            export_dir / "transformer_pruned_int8.onnx",
-            export_dir / "transformer_pruned.onnx",
-        ]
-        existing = next((p for p in candidates if p.exists()), None)
-        resolved_model = str(existing) if existing else None
+    export_metadata_path = export_dir / "portable_metadata.json"
+    if export_metadata_path.exists():
+        export_metadata = json.loads(export_metadata_path.read_text())
+        exported_model_path = export_metadata.get("exported_model_path")
+        if exported_model_path and Path(exported_model_path).exists():
+            return str(Path(exported_model_path))
 
-        if existing is None:
-            errors.append(
-                "No ONNX model found. Expected one of: "
-                + ", ".join(f"`{p}`" for p in candidates)
-            )
-
-    return len(errors) == 0, errors, resolved_model
+    candidates = [
+        export_dir / "transformer_export_int8.onnx",
+        export_dir / "transformer_export.onnx",
+        export_dir / "transformer_pruned_int8.onnx",
+        export_dir / "transformer_pruned.onnx",
+    ]
+    existing = next((p for p in candidates if p.exists()), None)
+    if existing is None:
+        raise FileNotFoundError(
+            f"No ONNX model found under {export_dir}. Expected one of: "
+            + ", ".join(str(p.name) for p in candidates)
+        )
+    return str(existing)
 
 
 def validate_user_table(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -72,7 +76,6 @@ def validate_user_table(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         return df, [f"Missing required column(s): {', '.join(missing)}"]
 
     cleaned = df.copy()
-
     cleaned["donation_date"] = pd.to_datetime(
         cleaned["donation_date"], errors="coerce", format="%Y-%m-%d"
     )
@@ -84,12 +87,12 @@ def validate_user_table(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     if invalid_date_rows.any():
         bad_rows = (cleaned.index[invalid_date_rows] + 1).tolist()
         errors.append(
-            f"Invalid `donation_date` in row(s): {bad_rows}. Use YYYY-MM-DD format."
+            f"Invalid donation_date in row(s): {bad_rows}. Use YYYY-MM-DD format."
         )
 
     if invalid_amount_rows.any():
         bad_rows = (cleaned.index[invalid_amount_rows] + 1).tolist()
-        errors.append(f"Invalid `amount` in row(s): {bad_rows}. Use numeric values.")
+        errors.append(f"Invalid amount in row(s): {bad_rows}. Use numeric values.")
 
     cleaned = cleaned.dropna(subset=["donation_date", "amount"]).copy()
 
@@ -99,7 +102,6 @@ def validate_user_table(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
     cleaned["amount"] = cleaned["amount"].astype(float)
     cleaned = cleaned.sort_values("donation_date").reset_index(drop=True)
-
     return cleaned, errors
 
 
@@ -116,53 +118,51 @@ def build_scoring_xlsx(user_history: pd.DataFrame) -> str:
     return tmp_path
 
 
-def render_result(result: dict, cleaned_df: pd.DataFrame, resolved_model: str | None) -> None:
+def build_gap_histogram_df(cleaned_df: pd.DataFrame) -> pd.DataFrame:
+    gap_df = cleaned_df.copy()
+    gap_df["donation_date"] = pd.to_datetime(gap_df["donation_date"])
+    gap_df = gap_df.sort_values("donation_date").reset_index(drop=True)
+    gap_df["gap_days"] = gap_df["donation_date"].diff().dt.days
+    gap_df = gap_df.dropna(subset=["gap_days"]).copy()
+    gap_df["gap_days"] = gap_df["gap_days"].astype(int)
+    return gap_df
+
+
+def render_result(result: dict, cleaned_df: pd.DataFrame) -> None:
     st.success("Scoring completed.")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Probability", f"{result['probability']:.6f}")
-    c2.metric("Horizon days", str(result["horizon_days"]))
-    c3.metric("Model", result["model_name"])
+    st.subheader("Probability of donation in next 30 days")
+    st.metric(
+        label="Probability of donation in next 30 days",
+        value=f"{result['probability']:.6f}",
+    )
 
     st.subheader("Input donation history")
     st.dataframe(cleaned_df, use_container_width=True)
 
-    if not cleaned_df.empty:
-        chart_df = cleaned_df.copy()
-        chart_df["donation_date"] = pd.to_datetime(chart_df["donation_date"])
-        chart_df = chart_df.sort_values("donation_date").set_index("donation_date")[["amount"]]
-        st.subheader("Donation amounts over time")
-        st.line_chart(chart_df)
+    chart_df = cleaned_df.copy()
+    chart_df["donation_date"] = pd.to_datetime(chart_df["donation_date"])
+    chart_df = chart_df.sort_values("donation_date").set_index("donation_date")[["amount"]]
 
-    st.subheader("Inference summary")
-    st.json(
-        {
-            "model_name": result["model_name"],
-            "model_path": resolved_model or result.get("model_path"),
-            "horizon_days": result["horizon_days"],
-            "slice_days": result["slice_days"],
-            "lookback_slices": result["lookback_slices"],
-            "anchor_stride_days": result["anchor_stride_days"],
-            "normalize": result["normalize"],
-            "normalization_method": result["normalization_method"],
-            "probability": result["probability"],
-        }
-    )
+    st.subheader("Donation amounts over time")
+    st.bar_chart(chart_df)
 
-    st.subheader("History statistics")
-    st.dataframe(result["history_stats"], use_container_width=True)
+    st.subheader("Donation amount distribution")
+    amount_hist = cleaned_df[["amount"]].copy()
+    st.bar_chart(amount_hist["amount"].value_counts(bins=10).sort_index())
 
-    st.subheader("Slice debug")
-    st.dataframe(result["slice_debug"], use_container_width=True)
-
-    st.subheader("Feature vector")
-    st.dataframe(result["features"], use_container_width=True)
+    st.subheader("Donation date gap distribution")
+    gap_df = build_gap_histogram_df(cleaned_df)
+    if gap_df.empty:
+        st.info("At least two donations are needed to compute date gaps.")
+    else:
+        st.bar_chart(gap_df["gap_days"].value_counts(bins=10).sort_index())
 
 
 def main() -> None:
     st.title("Donor Readiness Scorer")
     st.write(
-        "Enter a donor's donation history as rows of `donation_date` and `amount`, then run ONNX inference."
+        "Enter donation history as rows of `donation_date` and `amount`, then run ONNX inference."
     )
 
     with st.sidebar:
@@ -175,33 +175,46 @@ def main() -> None:
             value="",
             help="Leave blank to auto-detect under outputs_sequence/transformer/exported/",
         ).strip() or None
-        normalize = st.checkbox("Normalize", value=False)
+
+    try:
+        metadata = load_model_metadata(output_root, model_name)
+        resolved_model = resolve_onnx_path(
+            output_root=output_root,
+            model_name=model_name,
+            export_subdir=export_subdir,
+            exported_model=exported_model,
+        )
+    except Exception as e:
+        st.error(str(e))
+        st.stop()
+
+    saved_horizon = int(metadata["horizon_days"])
+    saved_normalize = bool(metadata.get("normalize", False))
+
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("Saved model settings")
+        st.write(f"Saved horizon_days: `{saved_horizon}`")
+        st.write(f"Saved normalize: `{saved_normalize}`")
         horizon_days = st.number_input(
             "Horizon days",
             min_value=1,
-            value=90,
+            value=saved_horizon,
             step=1,
+            help="Must match the saved model metadata.",
         )
-
-    ok, file_errors, resolved_model = ensure_required_files(
-        output_root=output_root,
-        model_name=model_name,
-        export_subdir=export_subdir,
-        exported_model=exported_model,
-    )
-
-    if not ok:
-        st.error("Deployment files are incomplete or misconfigured.")
-        for err in file_errors:
-            st.write(f"- {err}")
-        st.stop()
+        normalize = st.checkbox(
+            "Normalize",
+            value=saved_normalize,
+            help="Must match the saved model metadata.",
+        )
 
     st.subheader("Donation history input")
 
     starter_df = pd.DataFrame(
         [
-            {"donation_date": "2025-01-15", "amount": 100.0},
-            {"donation_date": "2025-03-01", "amount": 50.0},
+            {"donation_date": "2025-01-15", "amount": 30.0},
+            {"donation_date": "2025-03-01", "amount": 30.0},
             {"donation_date": "2025-06-20", "amount": 150.0},
         ]
     )
@@ -213,7 +226,7 @@ def main() -> None:
         key="donation_editor",
     )
 
-    st.caption("Use columns `donation_date` and `amount`. Dates must be in YYYY-MM-DD format.")
+    st.caption("Use columns donation_date and amount. Dates must be YYYY-MM-DD.")
 
     if st.button("Run score", type="primary"):
         cleaned_df, validation_errors = validate_user_table(edited_df)
@@ -221,6 +234,20 @@ def main() -> None:
         if validation_errors:
             for err in validation_errors:
                 st.error(err)
+            st.stop()
+
+        if horizon_days != saved_horizon:
+            st.error(
+                f"This model was trained for horizon_days={saved_horizon}. "
+                f"Set the sidebar value to {saved_horizon}."
+            )
+            st.stop()
+
+        if normalize != saved_normalize:
+            st.error(
+                f"This model was trained with normalize={saved_normalize}. "
+                f"Set the sidebar checkbox to {saved_normalize}."
+            )
             st.stop()
 
         temp_xlsx_path = build_scoring_xlsx(cleaned_df)
@@ -231,16 +258,14 @@ def main() -> None:
                 xlsx_path=temp_xlsx_path,
                 output_root=output_root,
                 email=INTERNAL_EMAIL,
-                horizon_days=int(horizon_days),
+                horizon_days=horizon_days,
                 normalize=normalize,
                 export_subdir=export_subdir,
                 exported_model=resolved_model,
             )
-            render_result(result, cleaned_df, resolved_model)
-
+            render_result(result, cleaned_df)
         except Exception as e:
             st.exception(e)
-
         finally:
             try:
                 Path(temp_xlsx_path).unlink(missing_ok=True)
